@@ -1,0 +1,57 @@
+{
+  "settings":{
+    "number_of_replicas":"0",
+    "number_of_shards":"1"
+  },
+  "mappings": {
+    "product": {
+      "properties": {
+        "fBrand": {
+          "type": "text",
+          "index": "true",
+          "analyzer": "ik_smart",
+          "search_analyzer": "ik_smart"
+        },
+        "fBuyingPrice": {
+          "type": "float"
+        },
+        "fCaption": {
+          "type": "keyword"
+        },
+        "fDesc": {
+          "type": "text",
+          "index": "true",
+          "analyzer": "ik_smart",
+          "search_analyzer": "ik_smart"
+        },
+        "fId": {
+          "type": "keyword"
+        },
+        "fName": {
+          "type": "text",
+          "index": "true",
+          "analyzer": "ik_smart",
+          "search_analyzer": "ik_smart"
+        },
+        "fSpell": {
+          "type": "keyword"
+        },
+        "fState": {
+          "type": "text"
+        },
+        "fTime": {
+          "type": "date"
+        },
+        "fTotalCount": {
+          "type": "long"
+        },
+        "fTotalSales": {
+          "type": "long"
+        },
+        "fUseType": {
+          "type": "text"
+        }
+      }
+    }
+  }
+}
