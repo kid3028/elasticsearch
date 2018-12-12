@@ -1,0 +1,20 @@
+{
+  "mappings":{
+    "sales":{
+      "properties":{
+        "price":{
+          "type":"long"
+        },
+        "color":{
+          "type":"keyword"
+        },
+        "brand":{
+          "type":"keyword"
+        },
+        "sold_date":{
+          "type":"date"
+        }
+      }
+    }
+  }
+}
