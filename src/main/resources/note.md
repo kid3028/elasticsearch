@@ -520,10 +520,192 @@ post /website/logs/_bulk
     - percentile_ranks 优化
         - TDigest算法：用很多节点来执行百分比的计算，近似估计，有误差，节点越多，越精准。
         - compression:限制节点的数量最多compression * 20,默认值100，越大，占用内存越多，越精准，性能越差，一个节点占用32byte，100*20*32=64kb
+        
+##基于doc_value正排索引分析聚合原理
+- 倒排索引的弊端：使用倒排索引必须要遍历整个倒排索引。因为可能需要聚合的那个field的值，是分词的，比如hello world my name --> 一个doc的聚合field的值可能在倒排索引中对应多个value，所以，但你在倒排索引中找到一个值，发现它是属于某个doc的时候，还不能停，必须遍历完整个倒排索引，才能说确保找到了每个doc对应的所有terms。然后进行分组聚合
+test     doc1
+hello    doc2, doc3
+world    doc2
+...
+- 正排索引：没有必须搜索完整的整个正排索引，比如有100w数据，搜索到15000次，就搜索完，就找到了1w个doc的聚合field的所有值，然后就可以执行分组聚合操作。
+100w：
+doc2:agg1 hello world
+doc3:agg2 test hello
+...
     
+###doc value原理
+（1）index-time生成
+    put、post的时候，就会生成doc value数据，也就是正排索引。
+（2）核心原理与倒排索引类似
+    正排索引，也会写入磁盘文件中，然后呢os cache先进行缓存，以提升访问doc value正排索引的性能，如果os  cache内存大小不足够放得下整个正排索引，就会将doc value的数据写入磁盘文件中。
+（3）性能问题：给jvm更少的内存，64g服务器，给jvm最多16g。
+    es大量是基于os cache来进行缓存和提升性能的，不建议使用jvm内存来进行缓存，那样会导致一定的gc开销和oom问题。给jvm更少的内存，给os cache更大的内存。64g服务器给jvm最多16g，几十个g的内存给os cache。os cache可以提升doc value和倒排索引的缓存和查询效率
+    
+###column压缩
+（1）所有值相同，直接保留单值
+        doc1:550
+        doc2:550
+        doc3:500
+        合并相同值，550，doc1和doc2都保留一个550的标识即可
+（2）少于256个值，使用table encoding模式(一种压缩方式)
+（3）大于256个值，看有没有最大公约数，有就除以最大公约数，然后保留这个最大公约数
+        doc1:36
+        doc2:24
+        6 --> doc1:6,doc2:4---> 保留一个最大公约数6的标识，6也保存起来
+（4）如果没有最大公约数，采取offset结合压缩的方式
 
+###disable doc value
+如果不需要doc value, 比如不进行聚合操作，那么可以禁用，减少磁盘空间的占用
+```
+put /my_index
+{
+    "mappings":{
+        "my_type":{
+            "properties":{
+                "my_field":{
+                    "type":"keyword",
+                    "doc_value":false
+                }
+            }
+        }
+    }
+}
+```
 
+###_string_field聚合分析以及fielddata原理
+- 对于分词的field执行aggregation，发现报错
 
+- 给分词的field，设置fielddata=true，发现可以执行 
+
+- 使用内置的field不分词，对string field进行聚合
+
+- 分词field+fielddata的工作原理
+    > doc value --> 不分词的搜索field可以执行聚合操作--> 如果某个field不分词，那么在index-time，就会自动生成doc value --> 针对这些分词的field执行聚合的时候，自动就会用doc value来执行。。
+
+分词field是没有doc value的，在index-time， 如果某个field是分词的，那么是不会给他建立doc value正排索引的，因为分词后，占用空间过大，所以默认是不支持分词field在进行聚合。因为分词field默认是没有doc value，所以直接对分词field执行聚合操作会报错
+
+对于分词field，必须打开和使用fielddata，完全存在于纯内存中，结构和doc value类似，如果是ngram或者大量term，那么必将占用大量的内存
+
+如果一定要对分词的field进行聚合，那么必须将fielddata=ture，然后es就会执行聚合操作的时候，现场将field对应的数据，建立一份fielddata正排索引，fielddata正排索引的结构跟doc value是类型的，但是只会将fielddata正排索引加载到内存中，然后基于内存中的fielddata正排索引执行分词field的聚合操作。
+
+如果直接对分词field指定聚合，报错，才会提示开启fielddata=true，如果将fielddata uninverted index，正排索引，加载到内存，会耗费内存空间
+
+为什么fielddata必须在内存？因为分词的字符串，需要按照term进行聚合，需要执行更加复杂的算法和操作，如果基于磁盘和os cache，那么性能会很差
+
+##_fielddata内存控制及circuit breaker断路由器
+###fielddata核心原理
+    fielddata加载到内存的过程是lazy加载的，对一个analyzed field执行聚合操作是，才会加载，而且是field-level加载的。一个index的一个field，所有doc都会被加载，而不是少数doc。不是index-time创建，而是query-time创建
+    
+###fielddata内存机制
+    indices.fielddata.cache.size : 20%，超出限制，清除内存已有fielddata数据.如果fielddata占用的内存超出这个比例的吸纳之，那么就清除内存中已有的fielddata数据
+    默认无限制，吸纳之内存使用，但是会导致频繁evict和reload，大量io性能损耗，以及内存碎片和gc
+    - 配置在elasticsearch.yml
+    
+    
+###监控fieldata内存使用
+   - get /_stats/fielddata?fields=*   es中所有fielddata内存占用情况
+   - get /_nodes/stats/indices/fielddata?fields=*   es每个node中fielddata内存占用情况
+   - get /_nodes/stats/indices/fielddata?level=indices&fields=*  es每个node中每个index下fielddata内存占用情况
+   
+###circuit breaker
+    如果一次query load的fielddata超过总内存，就会oom。circuit breaker会估算query要加载的fielddata大小，如果超出总内存，就短路，query直接失败
+  - indices.breaker.fielddata.limit:fielddata的内存限制，默认60%
+  - indices.breaker.request.limit:执行聚合的内存限制，默认40%
+  - indices.breaker.total.limit:综合上面两个，吸纳之在70%以内
+  - 配置在elasticsearch.yml
+  
+###_fielddata filter的细粒度内存加载控制
+```
+put /my_index/_mapping/my_type
+{
+    "properties" :{
+        "my_field":{
+            "type":"text",
+            "fielddata":{
+                "filter":{
+                    "frequency":{
+                        "min":0.01,
+                        "min_segement_size":500
+                    }
+                }
+            }
+        }
+    }
+}
+```
+min:仅仅加载至少在1%的doc中出现过的term对应的fielddata。比如某个值：hello，总共有1000个doc，hello必须在10个doc中出现，那么这个hello对应的fielddata才会加载到内存中
+min_segment_size:少于500 doc的segment不加载fielddata。加载fielddata的时候，也是按照segment进行加载的，如果某个segmen里面的doc数量少于500个，那么这个segment就不加载
+
+###_fielddata预加载机制以及序号标记预加载
+1、field预加载
+> 如果确实要对分词的fielddata执行聚合，那么每次都在query-time现场生产fielddata并加载到内存中，速度可能会比较慢，所以可以采用预加载的方式。
+```
+put /music/_mapping/_song
+{
+    "tags":{
+        "type":"string",
+        "fielddata":{
+            "loading":"eager"  // query_time的fielddata生产和加载到内存，变为index-time，建立倒排索引的时候，会同步生成fielddata并且加载到内存中，这样对分词的聚合性能会大幅增强
+        }
+    }
+}
+```
+2、序号标价预加载
+global ordinal : 
+    doc1:status1
+    doc2:status2
+    doc3:status2
+    doc4:status1
+    有很多重复值的情况，会进行global ordinal标记
+    status1 --> 0
+    status2 --> 1
+    doc1:0
+    doc2:1
+    doc3:1
+    doc4:0
+    建立这样的fielddata会减少重复字符串的出现次数，减少内存的消耗。
+```
+put /music/_mapping/_song
+{
+   "properties":{
+        "song_title":{
+               "type":"string",
+               "fielddata":{
+                   "loading":"eager_global_ordinals"
+               }
+        }
+    }
+}
+```
+
+##海量bucket优化机制：从深度优先到广度优先
+{
+    "aggs":{
+        "actors":{
+            "terms":{
+                "field":"actors",
+                "size":10,
+                "collect_mode":"breadth_first"  // 广度优先
+            }
+        },
+        "aggs":{
+            "costars":{
+                "terms":{
+                    "field":"films",
+                    "size":5
+                }
+            }
+        }
+    }
+}
+> 深度优先的方式去执行聚合操作
+       actor1                actor2         ...      actor
+film1 film2  film3     film1 film2 film3          film1 film2  film3
+假设有10w个actor，最后其实是主要10个actor就可以了。但是已经建立了深度优先的方式，构建了一棵完整的树出来，10w个actor，每个actor平均有10部电影，10w + 100w --> 110w的数据量的一棵树，裁剪掉10w个actor中的99999个，剩下10个actor，每个actor的10个film裁掉5个。构建了大量的数据，然后裁减掉99.9%的数据，比较浪费。
+
+> 改用广度优先的方式去执行聚合
+actor1          actor2          ...         actor
+10w个actor，不去构建它下面的film 数据，10w ---> 99990个actor裁剪掉，剩下10个actor，构建film，裁剪其中的5gefilm即可，10w-->50
 
 
 
