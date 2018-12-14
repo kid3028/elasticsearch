@@ -507,6 +507,30 @@ post /website/logs/_bulk
 {"index":{}}
 {"latency":302, "province":"新疆", "timestamp":"2018-10-29"}
 
+get /website/logs/_search
+{
+	"size":0,
+	"aggs":{
+		"group_by_province":{
+			"terms":{
+				"field":"province"
+			},
+			"aggs":{
+				"top_province":{
+					"top_hits":{        // 获取前几记录
+						"_source":{
+							"include":["province", "latency"]       // 设置显示字段
+						},
+						"size":3
+					}
+				}
+			}
+		}
+	}
+}
+
+
+
 ```
 - 需求：比如一个网站，记录下每次请求的访问耗时，需要统计tp50, tp90,tp99
     - tp50:50%的请求的耗时最长在多少时间
@@ -705,7 +729,186 @@ film1 film2  film3     film1 film2 film3          film1 film2  film3
 
 > 改用广度优先的方式去执行聚合
 actor1          actor2          ...         actor
-10w个actor，不去构建它下面的film 数据，10w ---> 99990个actor裁剪掉，剩下10个actor，构建film，裁剪其中的5gefilm即可，10w-->50
+10w个actor，不去构建它下面的film 数据，10w ---> 99990个actor裁剪掉，剩下10个actor，构建film，裁剪其中的5个film即可，10w-->50
+
+#数据建模
+##文件系统建模及文件搜索
+```
+put /fs
+{
+    "settings":{
+        "analysis":{
+            "analyzer":{
+                "paths":{
+                    "tokenizer":"path_hierarchy"
+                }
+            }
+        }
+    }
+    
+    get /fs/_analyze
+    {
+        "text":"/a/b/c/d",
+        "analyzer":"paths"
+    }
+
+}
+
+put /fs/_mapping/file
+{
+	"properties":{
+		"name":{
+			"type":"keyword"
+		},
+		"path":{
+			"type":"keyword",
+			"fields":{
+				"tree":{
+					"type":"text",
+					"analyzer":"paths"
+				}
+			}
+		}
+	}
+}
+
+
+put /fs/file/1
+{
+    "name":"README.TXT",
+    "path":"/var/study/es/elasticseach-demo",
+    "content":"elasticsearch学习demo，欢迎阅读！"
+}
+
+get /fs/file/_search
+{
+    "query": {
+        "bool": {
+            "must": [
+                {
+                    "match": {
+                        "content": "elasticsearch"
+                    }
+                },
+                {
+                    "constant_score": {
+                        "filter": {
+                            "term": {
+                                "path": "/elasticseach-demo"
+                            }
+                        }
+                    }
+                }
+            ]
+        }
+    }
+}
+
+// 搜索指定目录下的文件
+get /fs/file/_search
+{
+    "query": {
+        "bool": {
+            "must": [
+                {
+                    "match": {
+                        "content": "elasticsearch"
+                    }
+                },
+                {
+                    "constant_score": {
+                        "filter": {
+                            "term": {
+                                "path.tree": "/var/study/es"    //  "path.tree": "/var/study/es/" 错误 
+                            }
+                        }
+                    }
+                }
+            ]
+        }
+    }
+}
+```
+
+#全局锁实现悲观锁并发控制
+##全局锁
+   - 测试目录：/var/study/es。如果多个线程过来，要并发地给/var/study/es/elasticsearch-demo下的README.md修改文件名。需要进行并发控制，避免出现多线程的并发安全问题，比如多个线程修改，纯并发，先执行的修改操作被后执行的修改操作给覆盖了。
+    需要先获取到版本号，修改时携带version，如果修改时的version和获取的version不同，则需要重新获取version，尝试再次修改。
+   - 全局锁：直接锁掉整个fs index
+```
+PUT /fs/lock/global/_create
+{}
+- fs :需要上锁的index
+- lock：需要上锁的type
+- global：上的全局锁对应的这个doc的id
+- _create:前置必须是创建，如果/fs/lock/global这个doc已经存在，那么创建失败，报错
+- 例：
+> 
+    put /fs/file/global/_create
+    {}
+    response:
+    {
+      "_index": "fs",
+      "_type": "file",
+      "_id": "global",
+      "_version": 1,
+      "result": "created",
+      "_shards": {
+          "total": 2,
+          "successful": 1,
+          "failed": 0
+      },
+      "_seq_no": 0,
+      "_primary_term": 1
+  }
+  
+  另一个线程尝试对已经上锁的type上锁
+  {
+      "error": {
+          "root_cause": [
+              {
+                  "type": "version_conflict_engine_exception",
+                  "reason": "[file][global]: version conflict, document already exists (current version [1])",
+                  "index_uuid": "74omk64JQQKrIXFN8YWTVw",
+                  "shard": "2",
+                  "index": "fs"
+              }
+          ],
+          "type": "version_conflict_engine_exception",
+          "reason": "[file][global]: version conflict, document already exists (current version [1])",
+          "index_uuid": "74omk64JQQKrIXFN8YWTVw",
+          "shard": "2",
+          "index": "fs"
+      },
+      "status": 409
+  }
+
+post /fs/file/1
+{
+	"doc":{
+		"name":"readme.md"
+	}
+}
+{
+    "_index": "fs",
+    "_type": "file",
+    "_id": "1",
+    "_version": 3,
+    "result": "updated",
+    "_shards": {
+        "total": 2,
+        "successful": 1,
+        "failed": 0
+    },
+    "_seq_no": 5,
+    "_primary_term": 1
+}
+
+如果失败，再次尝试上锁，执行各种操作
+
+DELETE /fs/lock/global
+
+```
 
 
 

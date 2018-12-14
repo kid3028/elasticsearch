@@ -155,7 +155,7 @@ public class GeoPointSearchService {
 
     @Test
     public void distance() {
-        log.info("搜索距离当前位置一定距离的 酒店");
+        log.info("搜索距离当前位置一定距离的酒店");
         SearchRequestBuilder request = client.prepareSearch(HOTEL_INDEX).setTypes(HOTEL_TYPE)
                 .setQuery(QueryBuilders.boolQuery().must(QueryBuilders.matchAllQuery())
                         .filter(QueryBuilders.geoDistanceQuery("pin.location")
